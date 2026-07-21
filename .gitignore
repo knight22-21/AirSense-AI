@@ -1,3 +1,36 @@
+# ── AirSense AI — project-specific ignores ───────────────────────────────
+
+# Demo & presentation documents (keep off public repo)
+DEMO_SCRIPT.md
+docs/
+*.pdf
+
+# Trained ML model artifacts
+backend/models/aqi_model.pkl
+backend/models/*.pkl
+
+# Data files (large, generated locally — see data/*/README.md)
+data/training_data/*.csv
+data/ward_boundaries/*.geojson
+data/ward_boundaries/*.json
+
+# Frontend build output & dependencies
+frontend/node_modules/
+frontend/dist/
+
+# Backend virtual environments
+backend/venv/
+backend/.venv/
+venv/
+.venv/
+
+# Environment variable files (contain secrets)
+.env
+backend/.env
+frontend/.env
+
+# ── Python standard ignores ──────────────────────────────────────────────
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -216,3 +249,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+
+AirQuality_Project_Description.md
