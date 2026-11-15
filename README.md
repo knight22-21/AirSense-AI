@@ -24,23 +24,24 @@ Most city air-quality portals show you a number and a colour. AirSense AI goes t
 │                                                                          │
 │  OpenAQ v3 API          Open-Meteo API        NASA FIRMS API            │
 │  (PM2.5, PM10, NO₂)     (wind, humidity,      (fire/thermal anomaly     │
-│  No key required         temp, boundary        hotspots near Delhi)      │
-│                          layer height)                                   │
+│  Free key required       temp, boundary        hotspots near city)       │
+│  (mock fallback)         layer height)          + OSM industrial zones   │
 │              │                   │                      │                │
 │              └───────────────────┴──────────────────────┘               │
 │                                  │                                       │
-│                          APScheduler (30-min)                            │
-│                          polls all three APIs                            │
+│               APScheduler: AQI + weather every 30 min,                   │
+│               daily model retrain, 6-hour retention purge                │
 │                                  │                                       │
 │                     Supabase PostgreSQL                                  │
-│                     (aqi_readings, forecasts tables)                     │
+│                (aqi_readings, forecasts, alerts, weather)                │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    │
 ┌──────────────────── FASTAPI BACKEND ──────────────────────────────────────┐
 │                                                                            │
 │  /aqi/*          /forecast/*         /enforcement/*      /advisory/*      │
-│  Live + history  XGBoost forecast    Source attribution  Groq LLaMA3      │
-│  OpenAQ data     engine              (FIRMS + OSM)       bilingual text    │
+│  Live + history  XGBoost forecast    Source-receptor     Groq LLaMA3      │
+│  + ward IDW AQI  + backtest metrics  attribution         bilingual text    │
+│  /alerts/* — threshold breaches from the same live station network         │
 │                                                                            │
 └──────────────────────────────────┬─────────────────────────────────────────┘
                                    │ REST/JSON
@@ -72,11 +73,16 @@ Where `[C_lo, C_hi]` are the PM2.5 concentration breakpoints and `[I_lo, I_hi]` 
 
 ### 2. Data Ingestion — APScheduler + httpx
 
-`scheduler.py` registers two async jobs that fire every 30 minutes:
-- `_poll_aqi_data()` — calls OpenAQ v3 REST API, converts PM2.5 → AQI, upserts to Supabase
-- `_poll_weather_data()` — calls Open-Meteo for 72-hour hourly weather grid
+`scheduler.py` registers four jobs:
 
-All HTTP calls use `httpx.AsyncClient` (non-blocking) with a 15–20 second timeout. Every external call has a **static mock fallback** so the app works with zero internet connectivity — important for hackathon demos.
+| Job | Schedule | Purpose |
+|---|---|---|
+| `_poll_aqi_data()` | every 30 min | OpenAQ v3 REST → PM2.5 → AQI → Supabase; also writes threshold alerts |
+| `_poll_weather_data()` | every 30 min | Open-Meteo 72-hour hourly weather grid → Supabase |
+| `_retrain_models()` | daily 03:00 | Retrains one XGBoost model per city from up to 90 days of history |
+| `_purge_old_data()` | every 6 h | Deletes readings >30 days, forecasts >7 days, alerts >30 days |
+
+All HTTP calls use `httpx.AsyncClient` (non-blocking) with a 15–20 second timeout. Every external call has a **static mock fallback** so the app works with zero internet connectivity — important for hackathon demos. `python scheduler.py --seed --days 7` backfills history into both Supabase and `data/training_data/*.csv`.
 
 ---
 
@@ -88,58 +94,38 @@ All HTTP calls use `httpx.AsyncClient` (non-blocking) with a 15–20 second time
 
 | Feature group | Features |
 |---|---|
-| Calendar | hour-of-day, day-of-week, month, is_weekend |
-| Lag features | AQI at t−1h, t−3h, t−6h, t−12h, t−24h |
-| Rolling statistics | 6-hour rolling mean, 6-hour rolling std, 24-hour rolling mean |
+| Calendar | hour-of-day (sin/cos), day-of-week, month, is_weekend |
+| Lag features | AQI at t−1h, t−2h, t−3h, t−6h, t−12h, t−24h |
+| Rolling statistics | 6-hour mean, 6-hour std, 24-hour mean |
+| Weather | temperature, humidity, wind speed, wind direction (sin/cos), boundary-layer height |
 
 **Why lags + rolling stats?** Air quality has strong temporal autocorrelation — AQI at 3 AM tomorrow is heavily influenced by AQI at 3 AM today and the past 6-hour trend. Lags and rolling features capture this without needing an explicit time-series model.
 
-**Training:** 80/20 train-test split on station's last 30 days. RMSE is logged alongside a **persistence baseline** (predict tomorrow = today) to show real uplift.
+**Training and validation:** an 80/20 chronological split, backtested over the full 72-hour product horizon when history allows (minimum 6 hours). We report **RMSE and MAE against a persistence baseline** and store the score **per horizon** so degradation with lead time is visible. Confidence intervals are empirical 10th/90th residual quantiles from the backtest; models trained before this change are treated as stale and rebuilt. The endpoint returns `model_metrics.feature_importance` so the UI can show forecast drivers.
 
-**Fallback:** When the model hasn't been trained yet, a **diurnal statistical forecaster** is used. It applies empirically observed Delhi patterns: rush-hour peaks (7–10 AM × 1.2, 5–9 PM × 1.15) and pre-dawn lows (2–5 AM × 0.80) on top of the 24-hour rolling average, with Gaussian noise for realism.
+**Fallback:** When the model hasn't been trained or there is too little history, a **diurnal statistical forecaster** is used: a damped 24-hour rolling mean with rush-hour peaks (7–10 AM × 1.2, 5–9 PM × 1.15) and pre-dawn lows (2–5 AM × 0.80). No random noise is added — the fallback is deterministic and clearly labelled.
+
+**Honest limitation:** with only 7–14 days of history the backtest horizon is shorter than 72 hours and the persistence baseline is configured as same-hour-yesterday for the first 24 hours, then flat last-observation. The API reports the actual `horizon_hours`, `backtest_origins`, and sample count alongside every metric.
 
 ---
 
-### 4. Source Attribution — Spatial Scoring Engine
+### 4. Source Attribution — Source–Receptor Model
 
-`services/attribution.py` builds a ranked list of enforcement hotspots by scoring candidate locations:
+`services/attribution.py` no longer ranks fires directly. It separates **receptors** (CAAQMS stations, where people breathe) from **candidate sources**, then estimates which sources plausibly explain each station's AQI.
 
-**Inputs:**
-- NASA FIRMS VIIRS-SNPP fire detections (last 7 days, 375m resolution)
-- OSM Overpass API industrial land-use polygons around Delhi
+**Candidate sources built from:**
+- NASA FIRMS VIIRS-SNPP fire detections (last 7 days, 375m), clustered into fire complexes
+- OSM Overpass industrial land-use polygons
+- OSM construction sites and waste/dump sites
+- Traffic corridors derived from station pairs and major road proximity
 
-**Scoring algorithm per candidate:**
+**Per receptor station:**
+1. Compute distance and **upwind/downwind** position relative to each candidate source using station-level wind direction.
+2. Keep sources within the city radius; weight by inverse distance, wind alignment, fire radiative power (FRP), and source kind.
+3. Normalise to a local source mix: `traffic`, `construction`, `industry`, `waste_burning`, `background`.
+4. Attach a **confidence score** from evidence density (distance, multiple corroborating sources, satellite detections) and a priority label (`high` / `medium` / `low`).
 
-```
-score = 0
-
-# Fire radiative power (higher FRP = bigger burn)
-score += min(frp × 2.5, 40)
-
-# Detection confidence (FIRMS reports high / nominal / low)
-score += {high: 25, nominal: 12, low: 0}[confidence]
-
-# Industrial zone proximity (within 4 km → likely industrial emission, not just burning)
-if nearest_industrial_zone < 4 km:
-    score += 20
-
-# High-AQI corridor bonus (pre-known hotspots get +45 base)
-if location overlaps known high-pollution corridor:
-    score += 45 + (count of nearby industrial zones × 6)
-
-score = min(score, 100)  # cap at 100
-```
-
-**Haversine distance** is used throughout for precise great-circle distance between coordinates:
-
-```python
-def _dist_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    a = sin²(Δlat/2) + cos(lat1)·cos(lat2)·sin²(Δlon/2)
-    return 2R·arcsin(√a)
-```
-
-Top 3 hotspots by score are returned with evidence tags and a source type label (`waste_burning`, `industrial_emission`, `industrial_cluster`).
+**Haversine distance** is used throughout (`utils/geo.py → dist_km`) for great-circle distance. The hotspot object also exposes `receptor_station`, `distance_km`, `upwind`, `kind`, `frp`, and `confidence`, so an officer can see *what* is affected and *why* the source is suspected. If no OSM/FIRMS data is available, the service falls back to station-centred hotspots with clearly labelled provenance.
 
 ---
 
@@ -149,8 +135,8 @@ Two types of LLM-generated text via `services/llm.py`:
 
 **Enforcement summaries** — for each hotspot, a targeted 2-sentence prompt:
 ```
-"You are an air quality enforcement officer in Delhi.
-Location: <locality>, Source: <type>, Evidence: <tags>, Score: N/100
+"You are an air quality enforcement officer in <city>.
+Location: <locality>, Source: <type>, Evidence: <tags>, Score: N/100, Confidence: X%
 Write exactly 2 sentences: Sentence 1 = immediate action. Sentence 2 = expected impact."
 ```
 
@@ -160,7 +146,7 @@ Write exactly 2 sentences: Sentence 1 = immediate action. Sentence 2 = expected 
 Respond ONLY with valid JSON: {advisory_en, advisory_hi, vulnerable_groups}"
 ```
 
-The model is constrained to `max_tokens=120–300` and `temperature=0.3` to keep outputs short and factual. All LLM calls have static fallback text so the app works without a Groq key.
+The model is constrained to `max_tokens=120–300` and `temperature=0.3` to keep outputs short and factual. Generated text is cached in-process by a fingerprint of the hotspot evidence (and AQI/risk for advisories), so repeated dashboard loads do not burn quota. All LLM calls have static fallback text so the app works without a Groq key.
 
 **Why llama3-8b-8192?** It's the fastest model on Groq's free tier (14,400 req/day) and handles structured JSON output reliably at this short context length.
 
@@ -180,14 +166,13 @@ The model is constrained to `max_tokens=120–300` and `temperature=0.3` to keep
 
 ### 7. City Selector — Scalability Story
 
-The UI has a city dropdown with 5 cities: **Delhi** (live/mock data) and Mumbai, Bengaluru, Chennai, Kolkata (map renders, "Coming soon" overlay). This demonstrates the platform's multi-city architecture even though only Delhi has data in the MVP:
+The UI has a city dropdown with 5 cities: **Delhi, Mumbai, Bengaluru, Chennai, Kolkata**. All five are wired through the same pipeline; each falls back to its own station-level mock network when OpenAQ is unavailable:
 
-- Selecting any city flies the map to that city's coordinates
-- Non-Delhi cities show a "data coming soon" overlay on the map and sidebar
-- All hooks (`useAQIData`, `useEnforcement`, `useAdvisory`) accept a `city` param and re-fetch on change
-- Backend returns a `404` for non-Delhi cities — frontend handles this gracefully without crashing
+- Selecting a city flies the map to its coordinates and refetches stations, live AQI, wards, enforcement, advisories, and alerts
+- All hooks (`useAQIData`, `useEnforcement`, `useAdvisory`, `useAlerts`) accept a `city` param
+- Unknown city slugs return `404` and the frontend handles this without crashing
 
-To extend to a new city: add its entry in `frontend/src/config/cities.js`, add its mock stations in `backend/services/openaq.py`, and update the backend router city allow-list.
+To extend to a new city: add its entry in `backend/config.py`, mirror it in `frontend/src/config/cities.js`, and (optionally) add station fallbacks. Both the API and UI pick it up automatically.
 
 ---
 
@@ -227,10 +212,15 @@ The `data/` folder is **intentionally empty** in the repository. Both subdirecto
 cd backend
 python -m venv venv && venv\Scripts\activate   # Windows
 pip install -r requirements.txt
-cp .env.example .env    # Add SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY
+cp .env.example .env    # OPENAQ_API_KEY (v3 needs a free key), GROQ_API_KEY, NASA_FIRMS_MAP_KEY, SUPABASE_*
+# Optional: run db/schema.sql in the Supabase SQL editor (PostGIS tables)
+python scheduler.py --seed --days 7        # backfill history -> Supabase + data/training_data/*.csv
+python models/forecaster.py --train --city delhi --days 90   # train + log RMSE vs persistence
 uvicorn main:app --reload
-# → http://localhost:8000/docs  (Swagger UI)
+# http://localhost:8000/docs  (Swagger UI)
+pytest                                     # unit + API smoke tests
 ```
+Without keys everything still runs on clearly-flagged mock data (`data_source: "mock"`).
 
 ### Frontend
 ```bash
@@ -247,14 +237,19 @@ npm run dev
 
 | Method | Endpoint | What it returns |
 |---|---|---|
-| GET | `/aqi/stations` | All monitoring stations for the city |
-| GET | `/aqi/live` | Latest PM2.5 → AQI readings (all stations) |
-| GET | `/aqi/city/delhi` | City-level average + per-station breakdown |
-| GET | `/aqi/history/{station_id}?days=7` | Hourly historical readings (up to 30 days) |
-| GET | `/forecast/{station_id}?hours=72` | XGBoost AQI forecast (24 / 48 / 72 hours) |
-| POST | `/forecast/train/{station_id}` | Train / retrain XGBoost for a station |
-| GET | `/enforcement/delhi` | Top-3 hotspots with evidence + Groq summaries |
-| GET | `/advisory/delhi` | Bilingual (EN + HI) citizen health advisory |
+| GET | `/aqi/stations?city=` | Monitoring stations (delhi, mumbai, bengaluru, chennai, kolkata) |
+| GET | `/aqi/live?city=` | Latest PM2.5 -> AQI readings + `data_age_minutes`; `data_source` = openaq / db / mock |
+| GET | `/aqi/city/{city}` | City average + per-station breakdown + `data_age_minutes` |
+| GET | `/aqi/history/{station_id}?city=&days=7` | Hourly history (OpenAQ -> Supabase -> mock) |
+| GET | `/aqi/wards/{city}?with_aqi=true` | Ward boundary GeoJSON; optional IDW-interpolated AQI + `risk_level` per ward centroid |
+| GET | `/forecast/{station_id}?city=&hours=72` | Weather-aware recursive XGBoost forecast + `metrics` (RMSE/MAE vs persistence, per-horizon, feature importance) |
+| POST | `/forecast/train/{city}?days=90` | Train per-city model, 72-hour backtest, empirical quantile intervals |
+| GET | `/forecast/metrics/{city}` | Stored metrics incl. per-horizon accuracy and drivers |
+| GET | `/enforcement/{city}?limit=3&source_type=` | Ranked hotspots with source mix, `confidence`, `priority`, `receptor_station`, `distance_km`, `upwind` |
+| GET | `/alerts/{city}?threshold=200&hours=24` | Stations breaching a threshold, with severity, exceedance, and observation age |
+| GET | `/alerts?threshold=200&hours=24&limit=50` | Same alerts across all cities, sorted by AQI |
+| GET | `/advisory/{city}?station_id=` | Health advisory in EN / HI / TA / KN |
+| GET | `/advisory/{city}/wards` | Per-ward risk + vulnerable-population tags (schools, hospitals, workers) |
 | GET | `/health` | Server health check |
 
 ---
@@ -263,7 +258,7 @@ npm run dev
 
 | API | Free Limit | Used For |
 |---|---|---|
-| **OpenAQ v3** | No key needed | Live + historical PM2.5 from CAAQMS stations |
+| **OpenAQ v3** | Free API key (rate-limited) | Live + historical PM2.5 from CAAQMS stations |
 | **Open-Meteo** | Completely free | 72-hour hourly weather forecast grid |
 | **NASA FIRMS** | Free with map key | VIIRS fire/thermal anomaly detections (375m) |
 | **OSM Overpass** | Free, rate-limited | Industrial land-use polygons around Delhi |
@@ -283,7 +278,7 @@ npm run dev
 | ML | XGBoost 2.1, scikit-learn 1.5, pandas 2.2, numpy 2.1 |
 | LLM | Groq SDK, model: llama3-8b-8192 |
 | Database | Supabase (supabase-py client), PostgreSQL |
-| Frontend | React 18, Vite 5, Tailwind CSS 3 |
+| Frontend | React 18, Vite 8, Tailwind CSS 3 |
 | Maps | Leaflet 1.9, react-leaflet 4 |
 | Charts | Recharts 2 |
 | HTTP client | Axios |
@@ -296,7 +291,7 @@ npm run dev
 1. Connect GitHub → select `backend/` as root
 2. Build command: `pip install -r requirements.txt`
 3. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Add env vars: `SUPABASE_URL`, `SUPABASE_KEY`, `GROQ_API_KEY`, `NASA_FIRMS_MAP_KEY`
+4. Add env vars: `OPENAQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `GROQ_API_KEY`, `NASA_FIRMS_MAP_KEY`
 
 **Frontend:**
 1. Connect GitHub → select `frontend/` as root
