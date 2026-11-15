@@ -48,6 +48,10 @@ class ForecastResponse(BaseModel):
     generated_at: str
     horizon_hours: int
     forecasts: List[ForecastPoint]
+    model: str = "statistical"
+    data_source: str = "mock"
+    city: Optional[str] = None
+    metrics: Optional[dict] = None
 
 
 class EnforcementHotspot(BaseModel):
@@ -59,6 +63,8 @@ class EnforcementHotspot(BaseModel):
     evidence_tags: List[str]
     summary: str
     source_type: str
+    attribution: Optional[dict] = None
+    aqi: Optional[float] = None
 
 
 class AdvisoryResponse(BaseModel):
@@ -67,5 +73,7 @@ class AdvisoryResponse(BaseModel):
     aqi_value: float
     advisory_en: str
     advisory_hi: str
+    advisory_ta: str = ""
+    advisory_kn: str = ""
     generated_at: str
     vulnerable_groups: List[str]
