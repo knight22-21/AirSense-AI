@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useMemo } from 'react'
 import {
   ResponsiveContainer,
   LineChart,
@@ -19,6 +19,30 @@ const AQI_THRESHOLDS = [
   { value: 200, label: 'Unhealthy',  color: '#ff0000' },
   { value: 300, label: 'Very',       color: '#8f3f97' },
 ]
+
+const DRIVER_LABELS = {
+  hour_sin: 'Time of day', hour_cos: 'Time of day',
+  dow: 'Day of week', month: 'Season', is_weekend: 'Weekend',
+  roll_mean_6: 'Recent average (6h)', roll_mean_24: 'Recent average (24h)',
+  roll_std_6: 'Recent volatility',
+  temp: 'Temperature', hum: 'Humidity', wspd: 'Wind speed',
+  wsin: 'Wind direction', wcos: 'Wind direction', blh: 'Boundary layer',
+}
+
+function driverLabel(key) {
+  if (DRIVER_LABELS[key]) return DRIVER_LABELS[key]
+  const lag = key.match(/^lag_(\d+)$/)
+  return lag ? `AQI ${lag[1]}h ago` : key.replace(/_/g, ' ')
+}
+
+function topDrivers(importance, n = 4) {
+  const merged = {}
+  Object.entries(importance || {}).forEach(([key, value]) => {
+    const label = driverLabel(key)
+    merged[label] = (merged[label] || 0) + Number(value || 0)
+  })
+  return Object.entries(merged).sort((a, b) => b[1] - a[1]).slice(0, n)
+}
 
 function formatHour(ts) {
   if (!ts) return ''
@@ -42,8 +66,12 @@ function CustomTooltip({ active, payload, label }) {
   )
 }
 
-export default function ForecastChart({ station }) {
-  const { forecast, loading, error } = useForecast(station?.id)
+export default function ForecastChart({ station, city = 'delhi' }) {
+  const { forecast, loading, error } = useForecast(station?.id, city)
+  const drivers = useMemo(
+    () => topDrivers(forecast?.metrics?.feature_importance),
+    [forecast]
+  )
 
   if (!station) {
     return (
@@ -82,9 +110,36 @@ export default function ForecastChart({ station }) {
 
   return (
     <div>
-      <h3 className="text-sm font-semibold text-slate-300 mb-3">
+      <h3 className="text-sm font-semibold text-slate-300 mb-2">
         72-Hour AQI Forecast — {forecast.station_name}
       </h3>
+      <div className="flex flex-wrap gap-1 mb-3 text-xs">
+        <span className={`px-2 py-0.5 rounded-full font-medium ${
+          forecast.model === 'xgboost'
+            ? 'bg-blue-500/20 text-blue-300'
+            : 'bg-slate-700 text-slate-300'
+        }`}>
+          {forecast.model === 'xgboost' ? '🤖 XGBoost model' : '📊 Statistical fallback'}
+        </span>
+        {forecast.metrics?.rmse != null && (
+          <span className="px-2 py-0.5 rounded-full bg-green-500/15 text-green-300">
+            RMSE {Number(forecast.metrics.rmse).toFixed(1)}
+            {forecast.metrics.persistence_rmse != null &&
+              ` vs ${Number(forecast.metrics.persistence_rmse).toFixed(1)} persistence`}
+          </span>
+        )}
+        {forecast.metrics?.horizon_hours != null && forecast.metrics.horizon_hours < 72 && (
+          <span
+            className="px-2 py-0.5 rounded-full bg-slate-700 text-slate-300"
+            title="Backtest horizon is limited by available history"
+          >
+            validated on {forecast.metrics.horizon_hours}h backtest
+          </span>
+        )}
+        {forecast.data_source === 'mock' && (
+          <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300">⚠ Demo data</span>
+        )}
+      </div>
       <ResponsiveContainer width="100%" height={200}>
         <LineChart data={points} margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
@@ -131,6 +186,27 @@ export default function ForecastChart({ station }) {
           />
         </LineChart>
       </ResponsiveContainer>
+      {drivers.length > 0 && (
+        <div className="mt-3 pt-2 border-t border-slate-700/60">
+          <p className="text-xs font-medium text-slate-400 mb-1">Main forecast drivers</p>
+          <div className="space-y-1">
+            {drivers.map(([label, value]) => (
+              <div key={label} className="flex items-center gap-2 text-xs">
+                <span className="text-slate-400 w-32 truncate">{label}</span>
+                <div className="flex-1 h-1.5 bg-slate-700 rounded overflow-hidden">
+                  <div
+                    className="h-full bg-blue-500"
+                    style={{ width: `${Math.max(2, Math.min(100, value * 100))}%` }}
+                  />
+                </div>
+                <span className="text-slate-500 w-9 text-right">
+                  {(value * 100).toFixed(0)}%
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <p className="text-xs text-slate-500 mt-1 text-right">
         Generated: {new Date(forecast.generated_at).toLocaleString()}
       </p>

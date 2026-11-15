@@ -1,7 +1,7 @@
-import React, { useState } from 'react'
+import React, { useMemo, useState } from 'react'
 import AQIMap, { aqiColor, aqiLabel } from '../components/Map'
 import Sidebar from '../components/Sidebar'
-import { useAQIData, useEnforcement } from '../hooks/useAQI'
+import { useAQIData, useEnforcement, useWards, useAlerts } from '../hooks/useAQI'
 import { CITIES, getCityById } from '../config/cities'
 
 function AQIBadge({ aqi }) {
@@ -28,10 +28,7 @@ function CitySelector({ selectedCity, onChange }) {
       >
         <span className="text-blue-400">🏙</span>
         <span>{city.name}</span>
-        {city.hasData
-          ? <span className="text-xs text-green-400 font-normal">● Live</span>
-          : <span className="text-xs text-slate-400 font-normal">Coming soon</span>
-        }
+        <span className="text-xs text-green-400 font-normal">● Live</span>
         <span className="text-slate-400 text-xs ml-1">{open ? '▲' : '▼'}</span>
       </button>
 
@@ -51,15 +48,9 @@ function CitySelector({ selectedCity, onChange }) {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-slate-200">{c.name}</span>
-                  {c.hasData ? (
-                    <span className="text-xs text-green-400 bg-green-400/10 px-1.5 py-0.5 rounded">
-                      ● Live data
-                    </span>
-                  ) : (
-                    <span className="text-xs text-slate-500 bg-slate-700 px-1.5 py-0.5 rounded">
-                      Coming soon
-                    </span>
-                  )}
+                  <span className="text-xs text-green-400 bg-green-400/10 px-1.5 py-0.5 rounded">
+                    ● Live data
+                  </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-0.5 truncate">{c.description}</p>
               </div>
@@ -80,8 +71,23 @@ export default function Dashboard() {
 
   const city = getCityById(selectedCityId)
 
-  const { stations, liveReadings, loading, error, lastUpdated, refresh } = useAQIData(selectedCityId)
-  const { hotspots } = useEnforcement(selectedCityId)
+  const { stations, liveReadings, dataSource, dataAgeMinutes, loading, error, lastUpdated, refresh } = useAQIData(selectedCityId)
+  const { hotspots, dataSource: enfSource } = useEnforcement(selectedCityId)
+  const wards = useWards(selectedCityId)
+  const { alerts, threshold: alertThreshold } = useAlerts(selectedCityId, 200)
+  const isMock = dataSource === 'mock' || enfSource === 'mock'
+
+  const ageMinutes = useMemo(() => {
+    if (dataAgeMinutes != null) return dataAgeMinutes
+    const ages = liveReadings
+      .map(r => (Date.now() - new Date(r.timestamp).getTime()) / 60000)
+      .filter(Number.isFinite)
+    return ages.length ? Math.max(0, Math.min(...ages)) : null
+  }, [dataAgeMinutes, liveReadings])
+
+  const ageLabel = ageMinutes == null
+    ? null
+    : ageMinutes < 90 ? `${Math.round(ageMinutes)}m ago` : `${(ageMinutes / 60).toFixed(1)}h ago`
 
   // When city changes, clear station selection
   const handleCityChange = (id) => {
@@ -89,11 +95,29 @@ export default function Dashboard() {
     setSelectedStation(null)
   }
 
+  const focusTopAlert = () => {
+    const a = alerts[0]
+    if (!a) return
+    const st = stations.find(s => s.id === a.station_id)
+    const reading = liveReadings.find(r => r.station_id === a.station_id)
+    const base = st || reading
+    if (base) {
+      setSelectedStation({
+        ...base,
+        id: base.id || base.station_id,
+        name: base.name || base.station_name,
+        latitude: base.latitude,
+        longitude: base.longitude,
+        aqi: a.aqi,
+      })
+    }
+  }
+
   return (
     <div className="flex flex-col h-screen bg-slate-900 overflow-hidden">
 
       {/* ── Header ── */}
-      <header className="flex items-center justify-between px-4 py-2.5 bg-slate-800 border-b border-slate-700 flex-shrink-0 gap-3">
+      <header className="flex flex-wrap items-center justify-between px-3 sm:px-4 py-2.5 bg-slate-800 border-b border-slate-700 flex-shrink-0 gap-3">
         {/* Brand */}
         <div className="flex items-center gap-3 flex-shrink-0">
           <div>
@@ -109,6 +133,14 @@ export default function Dashboard() {
 
         {/* Right side info */}
         <div className="flex items-center gap-3 flex-shrink-0">
+          {isMock && (
+            <span
+              title="Live sources unavailable — showing demo data"
+              className="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/40"
+            >
+              ⚠ Demo data
+            </span>
+          )}
           {selectedStation && city.hasData && (
             <div className="hidden sm:flex items-center gap-2 text-sm">
               <span className="text-slate-400 text-xs">Station:</span>
@@ -117,8 +149,13 @@ export default function Dashboard() {
             </div>
           )}
           {lastUpdated && (
-            <p className="text-xs text-slate-500 hidden lg:block">
-              {lastUpdated.toLocaleTimeString()}
+            <p
+              className={`text-xs hidden lg:block ${
+                ageMinutes != null && ageMinutes > 60 ? 'text-amber-400' : 'text-slate-500'
+              }`}
+              title={`Fetched at ${lastUpdated.toLocaleTimeString()}`}
+            >
+              {ageLabel ? `Data ${ageLabel}` : lastUpdated.toLocaleTimeString()}
             </p>
           )}
           <button
@@ -134,7 +171,7 @@ export default function Dashboard() {
       {/* ── Error banner ── */}
       {error && city.hasData && (
         <div className="bg-red-900/40 border-b border-red-800 px-4 py-1.5 text-red-300 text-xs flex-shrink-0">
-          ⚠ Backend issue: {error} — showing cached/mock data for Delhi.
+          ⚠ Backend issue: {error} — showing cached/mock data.
         </div>
       )}
 
@@ -160,17 +197,35 @@ export default function Dashboard() {
         </span>
       </div>
 
+      {/* ── Threshold alerts ── */}
+      {alerts.length > 0 && (
+        <div className="flex items-center justify-between gap-3 px-4 py-2 bg-red-900/30 border-b border-red-800/70 text-xs flex-shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-red-300 font-semibold flex-shrink-0">
+              🚨 {alerts.length} station{alerts.length > 1 ? 's' : ''} above AQI {alertThreshold}
+            </span>
+            <span className="text-red-200/80 truncate">{alerts[0].message}</span>
+          </div>
+          <button
+            onClick={focusTopAlert}
+            className="flex-shrink-0 px-2 py-1 rounded bg-red-700/50 hover:bg-red-700 text-red-100 transition-colors"
+          >
+            Focus worst →
+          </button>
+        </div>
+      )}
+
       {/* ── Main layout: map + sidebar ── */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-col md:flex-row flex-1 overflow-hidden min-h-0">
 
         {/* Map */}
-        <div className="flex-1 relative min-w-0">
+        <div className="h-[48vh] md:h-auto md:flex-1 flex-shrink-0 relative min-w-0">
           {loading && !liveReadings.length ? (
             <div className="absolute inset-0 flex items-center justify-center bg-slate-900 z-10">
               <div className="text-center">
                 <div className="text-4xl mb-3 animate-pulse">🌫️</div>
                 <p className="text-slate-400 text-sm">
-                  {city.hasData ? 'Fetching AQI data…' : `Loading map for ${city.name}…`}
+                  Fetching AQI data…
                 </p>
               </div>
             </div>
@@ -183,29 +238,27 @@ export default function Dashboard() {
               onStationSelect={setSelectedStation}
               cityCenter={[city.lat, city.lon]}
               cityZoom={city.zoom}
-              cityHasData={city.hasData}
+              wards={wards}
             />
           )}
         </div>
 
         {/* Sidebar */}
-        <div className="w-80 xl:w-96 flex-shrink-0 border-l border-slate-700 overflow-hidden">
+        <div className="w-full md:w-80 xl:w-96 flex-1 md:flex-none min-h-0 border-t md:border-t-0 md:border-l border-slate-700 overflow-hidden">
           <Sidebar
             selectedStation={selectedStation}
             liveReadings={liveReadings}
             city={selectedCityId}
             cityHasData={city.hasData}
+            dataSource={dataSource}
           />
         </div>
       </div>
 
       {/* ── Footer ── */}
-      <footer className="flex items-center justify-between px-4 py-1.5 bg-slate-800 border-t border-slate-700 text-xs text-slate-500 flex-shrink-0">
+      <footer className="hidden sm:flex items-center justify-between px-4 py-1.5 bg-slate-800 border-t border-slate-700 text-xs text-slate-500 flex-shrink-0">
         <span>
-          {city.hasData
-            ? `${liveReadings.length} stations · ${hotspots.length} enforcement hotspots · ${city.fullName}`
-            : `${city.fullName} — no data in MVP`
-          }
+          {`${liveReadings.length} stations · ${hotspots.length} enforcement hotspots · ${city.fullName}`}
         </span>
         <span className="hidden sm:block">
           OpenAQ · Open-Meteo · NASA FIRMS · OSM · Groq LLaMA3-8b

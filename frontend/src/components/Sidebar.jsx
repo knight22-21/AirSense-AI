@@ -9,7 +9,7 @@ const TABS = [
   { id: 'advisory',   label: '🏥 Advisory' },
 ]
 
-export default function Sidebar({ selectedStation, liveReadings, city, cityHasData }) {
+export default function Sidebar({ selectedStation, liveReadings, city, cityHasData = true, dataSource }) {
   const [tab, setTab] = useState('forecast')
 
   const aqiValues = liveReadings.map(r => r.aqi).filter(Boolean)
@@ -21,6 +21,11 @@ export default function Sidebar({ selectedStation, liveReadings, city, cityHasDa
 
   return (
     <div className="h-full flex flex-col bg-slate-900 overflow-hidden">
+      {dataSource === 'mock' && (
+        <div className="px-3 py-1 text-xs bg-amber-500/10 text-amber-300 border-b border-amber-500/30 flex-shrink-0">
+          ⚠ Demo data — live OpenAQ feed unavailable
+        </div>
+      )}
       {/* Stats bar */}
       <div className="grid grid-cols-3 gap-1 p-3 border-b border-slate-700 bg-slate-800/60">
         <div className="text-center">
@@ -43,7 +48,7 @@ export default function Sidebar({ selectedStation, liveReadings, city, cityHasDa
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
-            className={`flex-1 py-2.5 text-xs font-medium transition-colors ${
+            className={`flex-1 py-3 md:py-2.5 text-xs font-medium transition-colors ${
               tab === t.id
                 ? 'border-b-2 border-blue-500 text-blue-400 bg-slate-800/40'
                 : 'text-slate-500 hover:text-slate-300'
@@ -66,7 +71,7 @@ export default function Sidebar({ selectedStation, liveReadings, city, cityHasDa
           </div>
         ) : (
           <>
-            {tab === 'forecast' && <ForecastChart station={selectedStation} />}
+            {tab === 'forecast' && <ForecastChart station={selectedStation} city={city} />}
             {tab === 'enforcement' && <EnforcementPanel city={city} />}
             {tab === 'advisory' && <AdvisoryCard city={city} />}
           </>

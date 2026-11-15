@@ -1,5 +1,5 @@
-import React, { useEffect } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Popup, Marker, useMap } from 'react-leaflet'
+import React, { useEffect, useMemo, useState } from 'react'
+import { MapContainer, TileLayer, CircleMarker, Popup, Marker, Rectangle, GeoJSON, useMap } from 'react-leaflet'
 import L from 'leaflet'
 
 // Fix Leaflet default marker icons broken by Vite bundling
@@ -52,6 +52,124 @@ function FlyToCity({ center, zoom }) {
   return null
 }
 
+// ── Heat layer: inverse-distance-weighted grid of coloured rectangles (no extra deps) ──
+const GRID_N = 14
+const HALF_SPAN_LAT = 0.22
+const HALF_SPAN_LON = 0.26
+
+function idwAQI(lat, lon, pts) {
+  let num = 0, den = 0
+  for (const p of pts) {
+    const d2 = (p.latitude - lat) ** 2 + (p.longitude - lon) ** 2
+    if (d2 < 1e-8) return p.aqi
+    const w = 1 / d2
+    num += w * p.aqi
+    den += w
+  }
+  return den ? num / den : null
+}
+
+function HeatLayer({ center, points }) {
+  const cells = useMemo(() => {
+    if (!points.length) return []
+    const out = []
+    const dLat = (2 * HALF_SPAN_LAT) / GRID_N
+    const dLon = (2 * HALF_SPAN_LON) / GRID_N
+    for (let i = 0; i < GRID_N; i++) {
+      for (let j = 0; j < GRID_N; j++) {
+        const south = center[0] - HALF_SPAN_LAT + i * dLat
+        const west  = center[1] - HALF_SPAN_LON + j * dLon
+        const aqi = idwAQI(south + dLat / 2, west + dLon / 2, points)
+        out.push({ key: `${i}-${j}`, aqi, bounds: [[south, west], [south + dLat, west + dLon]] })
+      }
+    }
+    return out
+  }, [center[0], center[1], points])
+
+  return cells.map(c => (
+    <Rectangle
+      key={c.key}
+      bounds={c.bounds}
+      pathOptions={{ stroke: false, fillColor: aqiColor(c.aqi), fillOpacity: 0.28, interactive: false }}
+    />
+  ))
+}
+
+// ── Ward overlay: backend IDW AQI when available, nearest-station fallback otherwise ──
+function WardLayer({ wards, points }) {
+  const data = useMemo(() => {
+    if (!wards?.features?.length) return null
+    return {
+      ...wards,
+      features: wards.features.map(f => {
+        const props = f.properties || {}
+        if (props.aqi != null) {
+          return { ...f, properties: { ...props, _aqi: props.aqi, _source: 'idw' } }
+        }
+        if (!points.length) {
+          return { ...f, properties: { ...props, _aqi: null, _source: null } }
+        }
+        const c = L.geoJSON(f).getBounds().getCenter()
+        let best = points[0], bd = Infinity
+        for (const p of points) {
+          const d = (p.latitude - c.lat) ** 2 + (p.longitude - c.lng) ** 2
+          if (d < bd) { bd = d; best = p }
+        }
+        return { ...f, properties: { ...props, _aqi: best.aqi, _source: 'nearest' } }
+      }),
+    }
+  }, [wards, points])
+
+  if (!data) return null
+  const sig = data.features.length + ':' + data.features.reduce((a, f) => a + (f.properties._aqi || 0), 0)
+  return (
+    <GeoJSON
+      key={sig}
+      data={data}
+      style={f => ({
+        color: '#e2e8f0', weight: 1, opacity: 0.6,
+        fillColor: aqiColor(f.properties._aqi), fillOpacity: f.properties._source === 'idw' ? 0.38 : 0.28,
+      })}
+      onEachFeature={(f, layer) => {
+        const aqi = f.properties._aqi
+        const source = f.properties._source === 'idw'
+          ? 'interpolated (IDW)'
+          : f.properties._source === 'nearest' ? 'nearest station' : ''
+        layer.bindPopup(
+          `<b>${f.properties.name || 'Ward'}</b><br/>AQI ${aqi ? aqi.toFixed(0) : 'N/A'} · ${aqiLabel(aqi)}` +
+          (source ? `<br/><span style="color:#6b7280;font-size:11px">${source}</span>` : '')
+        )
+      }}
+    />
+  )
+}
+
+function LayerControls({ layers, setLayers }) {
+  const stop = e => e.stopPropagation()
+  const items = [['heat', 'AQI heat layer'], ['wards', 'Ward boundaries'], ['hotspots', 'Hotspots']]
+  return (
+    <div
+      onClick={stop} onMouseDown={stop} onDoubleClick={stop} onTouchStart={stop} onWheel={stop}
+      style={{
+        position: 'absolute', top: 10, right: 10, zIndex: 1000,
+        background: 'rgba(15,23,42,0.88)', border: '1px solid #475569',
+        borderRadius: 8, padding: '6px 10px', color: '#e2e8f0', fontSize: 12,
+      }}
+    >
+      {items.map(([k, label]) => (
+        <label key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={layers[k]}
+            onChange={e => setLayers(l => ({ ...l, [k]: e.target.checked }))}
+          />
+          {label}
+        </label>
+      ))}
+    </div>
+  )
+}
+
 export default function AQIMap({
   liveReadings,
   stations,
@@ -60,28 +178,41 @@ export default function AQIMap({
   selectedStation,
   cityCenter,   // [lat, lon]
   cityZoom,
-  cityHasData,
+  wards,
 }) {
-  // Merge live AQI values into the station list
-  const stationAQI = {}
-  liveReadings.forEach(r => { stationAQI[r.station_id] = r.aqi })
+  const [layers, setLayers] = useState({ heat: true, wards: true, hotspots: true })
+  // Merge live AQI values (and observation time) into the station list
+  const latestReading = {}
+  liveReadings.forEach(r => { latestReading[r.station_id] = r })
 
   const displayStations = stations.length > 0
-    ? stations.map(s => ({ ...s, aqi: stationAQI[s.id] ?? null }))
+    ? stations.map(s => ({
+        ...s,
+        aqi: latestReading[s.id]?.aqi ?? null,
+        timestamp: latestReading[s.id]?.timestamp,
+        source: latestReading[s.id]?.source,
+      }))
     : liveReadings.map(r => ({
         id: r.station_id,
         name: r.station_name,
         latitude: r.latitude,
         longitude: r.longitude,
         aqi: r.aqi,
+        timestamp: r.timestamp,
+        source: r.source,
       }))
+
+  const aqiPoints = useMemo(
+    () => displayStations.filter(s => s.aqi && s.latitude != null && s.longitude != null),
+    [stations, liveReadings]
+  )
 
   return (
     <MapContainer
       center={cityCenter}
       zoom={cityZoom}
       className="w-full h-full"
-      style={{ minHeight: '500px' }}
+      style={{ minHeight: '280px' }}
     >
       <FlyToCity center={cityCenter} zoom={cityZoom} />
 
@@ -91,28 +222,13 @@ export default function AQIMap({
         opacity={0.6}
       />
 
-      {/* "Coming soon" overlay when no data for this city */}
-      {!cityHasData && (
-        <div
-          style={{
-            position: 'absolute', inset: 0, zIndex: 1000,
-            display: 'flex', flexDirection: 'column',
-            alignItems: 'center', justifyContent: 'center',
-            background: 'rgba(15,23,42,0.72)', pointerEvents: 'none',
-          }}
-        >
-          <p style={{ color: '#94a3b8', fontSize: 32, marginBottom: 8 }}>🏙️</p>
-          <p style={{ color: '#e2e8f0', fontWeight: 700, fontSize: 16 }}>
-            Data coming soon for this city
-          </p>
-          <p style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
-            Delhi is the only city with live / mock data in this MVP
-          </p>
-        </div>
-      )}
+      <LayerControls layers={layers} setLayers={setLayers} />
+
+      {layers.heat && <HeatLayer center={cityCenter} points={aqiPoints} />}
+      {layers.wards && <WardLayer wards={wards} points={aqiPoints} />}
 
       {/* AQI station circle markers */}
-      {cityHasData && displayStations.map(station => {
+      {displayStations.map(station => {
         const color = aqiColor(station.aqi)
         const isSelected = selectedStation?.id === station.id
         return (
@@ -138,6 +254,11 @@ export default function AQIMap({
                 <p style={{ color: '#9ca3af', fontSize: 11, marginTop: 4 }}>
                   {station.latitude?.toFixed(4)}, {station.longitude?.toFixed(4)}
                 </p>
+                {station.timestamp && !Number.isNaN(new Date(station.timestamp).getTime()) && (
+                  <p style={{ color: '#9ca3af', fontSize: 11 }}>
+                    Observed {new Date(station.timestamp).toLocaleString()}
+                  </p>
+                )}
                 <button
                   onClick={() => onStationSelect && onStationSelect(station)}
                   style={{
@@ -155,7 +276,7 @@ export default function AQIMap({
       })}
 
       {/* Enforcement hotspot markers */}
-      {cityHasData && hotspots.map(h => (
+      {layers.hotspots && hotspots.map(h => (
         <Marker
           key={`hotspot-${h.rank}`}
           position={[h.latitude, h.longitude]}
@@ -168,6 +289,18 @@ export default function AQIMap({
               <p style={{ fontSize: 11, color: '#6b7280', marginTop: 2 }}>
                 Risk score: {h.score}/100 · {h.source_type?.replace(/_/g, ' ')}
               </p>
+              {h.confidence != null && (
+                <p style={{ fontSize: 11, color: '#6b7280' }}>
+                  Confidence: {Math.round(h.confidence * 100)}% · priority {h.priority || '—'}
+                </p>
+              )}
+              {h.receptor_station && (
+                <p style={{ fontSize: 11, color: '#6b7280' }}>
+                  Affects {h.receptor_station}
+                  {h.distance_km != null ? ` (${h.distance_km} km)` : ''}
+                  {h.upwind ? ' · upwind' : ''}
+                </p>
+              )}
               <div style={{ marginTop: 6 }}>
                 {h.evidence_tags?.slice(0, 2).map((tag, i) => (
                   <span key={i} style={{
