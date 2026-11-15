@@ -1,132 +1,198 @@
-import httpx
+"""OpenAQ v3 client. v3 requires an API key (free): set OPENAQ_API_KEY.
+
+Flow: /locations (near city centre, PM2.5 sensors) -> /locations/{id}/latest for live values
+-> /sensors/{id}/hours for hourly history. Every step falls back (DB, then seeded mock data).
+"""
+import os
+import asyncio
+import math
+import random
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict
+import httpx
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional
+
+from config import get_city, city_of_station
+from utils.cache import cache_get, cache_set
 
 logger = logging.getLogger(__name__)
 OPENAQ_BASE = "https://api.openaq.org/v3"
+PM25_PARAMETER_ID = 2
+MAX_LIVE_STATIONS = 12
 
-# Hardcoded Delhi CAAQMS stations as authoritative fallback
-_DELHI_STATIONS = [
-    {"id": "anand-vihar",   "name": "Anand Vihar",       "city": "Delhi", "latitude": 28.6469, "longitude": 77.3164},
-    {"id": "rk-puram",      "name": "RK Puram",           "city": "Delhi", "latitude": 28.5640, "longitude": 77.1742},
-    {"id": "punjabi-bagh",  "name": "Punjabi Bagh",       "city": "Delhi", "latitude": 28.6667, "longitude": 77.1167},
-    {"id": "mandir-marg",   "name": "Mandir Marg",        "city": "Delhi", "latitude": 28.6363, "longitude": 77.2008},
-    {"id": "igi-airport",   "name": "IGI Airport T3",     "city": "Delhi", "latitude": 28.5665, "longitude": 77.1031},
-    {"id": "shadipur",      "name": "Shadipur",           "city": "Delhi", "latitude": 28.6518, "longitude": 77.1427},
-    {"id": "okhla-phase2",  "name": "Okhla Phase-II",     "city": "Delhi", "latitude": 28.5355, "longitude": 77.2710},
-    {"id": "rohini",        "name": "Rohini",             "city": "Delhi", "latitude": 28.7494, "longitude": 77.0647},
-]
+# station_id -> pm25 sensor id (filled by fetch_stations)
+_SENSORS: Dict[str, int] = {}
 
 
-async def fetch_delhi_stations() -> List[Dict]:
-    """Return Delhi AQI stations. Tries OpenAQ v3, falls back to static list."""
-    async with httpx.AsyncClient(timeout=15) as client:
+def _headers() -> Dict[str, str]:
+    h = {"Accept": "application/json"}
+    key = os.getenv("OPENAQ_API_KEY", "")
+    if key:
+        h["X-API-Key"] = key
+    return h
+
+
+def _has_key() -> bool:
+    return bool(os.getenv("OPENAQ_API_KEY"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ------------------------------------------------------------------
+# Stations
+# ------------------------------------------------------------------
+
+async def fetch_stations(city: str = "delhi") -> List[Dict]:
+    cfg = get_city(city)
+    cached = cache_get(f"stations:{cfg['id']}", 3600)
+    if cached:
+        return cached
+    if _has_key():
         try:
-            resp = await client.get(
-                f"{OPENAQ_BASE}/locations",
-                params={"city": "Delhi", "country_id": "IN", "limit": 25},
-                headers={"Accept": "application/json"},
-            )
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{OPENAQ_BASE}/locations",
+                    params={"coordinates": f"{cfg['lat']},{cfg['lon']}", "radius": cfg["radius_m"],
+                            "parameters_id": PM25_PARAMETER_ID, "limit": 100},
+                    headers=_headers(),
+                )
             if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                if results:
-                    stations = []
-                    for loc in results:
-                        coords = loc.get("coordinates") or {}
-                        stations.append({
-                            "id": str(loc.get("id", "")),
-                            "name": loc.get("name", "Unknown"),
-                            "city": "Delhi",
-                            "latitude": coords.get("latitude", 28.6139),
-                            "longitude": coords.get("longitude", 77.2090),
-                        })
-                    return stations
+                stations = []
+                for loc in resp.json().get("results", []):
+                    coords = loc.get("coordinates") or {}
+                    sensor = next((s for s in loc.get("sensors", [])
+                                   if (s.get("parameter") or {}).get("id") == PM25_PARAMETER_ID), None)
+                    if not sensor or coords.get("latitude") is None:
+                        continue
+                    sid = str(loc["id"])
+                    _SENSORS[sid] = sensor["id"]
+                    stations.append({"id": sid, "name": loc.get("name") or f"Station {sid}",
+                                     "city": cfg["name"], "latitude": coords["latitude"],
+                                     "longitude": coords["longitude"], "source": "openaq"})
+                if stations:
+                    from db.supabase_client import save_stations
+                    asyncio.create_task(save_stations(cfg["id"], stations))
+                    return cache_set(f"stations:{cfg['id']}", stations)
+            else:
+                logger.warning(f"OpenAQ locations HTTP {resp.status_code}: {resp.text[:120]}")
         except Exception as e:
             logger.warning(f"OpenAQ stations fetch failed: {e}")
-    return _DELHI_STATIONS
+    return [{**s, "city": cfg["name"], "source": "mock"} for s in cfg["stations"]]
 
 
-async def fetch_live_aqi() -> List[Dict]:
-    """Fetch latest PM2.5 readings for Delhi. Falls back to seeded mock data."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.get(
-                f"{OPENAQ_BASE}/measurements",
-                params={
-                    "country_id": "IN",
-                    "city": "Delhi",
-                    "parameter": "pm25",
-                    "limit": 30,
-                    "sort": "desc",
-                    "order_by": "datetime",
-                },
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code == 200:
+# kept for backwards compatibility with older callers
+async def fetch_delhi_stations() -> List[Dict]:
+    return await fetch_stations("delhi")
+
+
+# ------------------------------------------------------------------
+# Live
+# ------------------------------------------------------------------
+
+async def _latest_for(client: httpx.AsyncClient, station: Dict) -> Optional[Dict]:
+    sid = station["id"]
+    sensor_id = _SENSORS.get(sid)
+    try:
+        resp = await client.get(f"{OPENAQ_BASE}/locations/{sid}/latest", headers=_headers())
+        if resp.status_code != 200:
+            return None
+        for item in resp.json().get("results", []):
+            if sensor_id is not None and item.get("sensorsId") != sensor_id:
+                continue
+            val = item.get("value")
+            if val is None or val < 0:
+                continue
+            coords = item.get("coordinates") or {}
+            return {
+                "station_id": sid, "station_name": station["name"], "parameter": "pm25",
+                "value": val, "unit": "µg/m³",
+                "timestamp": (item.get("datetime") or {}).get("utc", _now_iso()),
+                "latitude": coords.get("latitude", station["latitude"]),
+                "longitude": coords.get("longitude", station["longitude"]),
+                "aqi": _pm25_to_aqi(val), "source": "openaq",
+            }
+    except Exception as e:
+        logger.warning(f"OpenAQ latest failed for {sid}: {e}")
+    return None
+
+
+async def fetch_live_aqi(city: str = "delhi") -> List[Dict]:
+    cfg = get_city(city)
+    cached = cache_get(f"live:{cfg['id']}", 120)
+    if cached:
+        return cached
+    if _has_key():
+        stations = [s for s in await fetch_stations(city) if s.get("source") == "openaq"][:MAX_LIVE_STATIONS]
+        if stations:
+            async with httpx.AsyncClient(timeout=20) as client:
+                results = await asyncio.gather(*[_latest_for(client, s) for s in stations])
+            readings = [r for r in results if r]
+            if readings:
+                return cache_set(f"live:{cfg['id']}", readings)
+    return _mock_live_aqi(cfg["id"])
+
+
+# ------------------------------------------------------------------
+# History
+# ------------------------------------------------------------------
+
+async def _openaq_history(station_id: str, days: int) -> List[Dict]:
+    sensor_id = _SENSORS.get(station_id)
+    if sensor_id is None:
+        return []
+    now = datetime.now(timezone.utc)
+    date_from = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out: List[Dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            for page in range(1, 6):  # up to 5000 hourly points (~200 days)
+                resp = await client.get(
+                    f"{OPENAQ_BASE}/sensors/{sensor_id}/hours",
+                    params={"datetime_from": date_from, "limit": 1000, "page": page},
+                    headers=_headers(),
+                )
+                if resp.status_code != 200:
+                    break
                 items = resp.json().get("results", [])
-                if items:
-                    return [_shape_measurement(m) for m in items]
-        except Exception as e:
-            logger.warning(f"OpenAQ live fetch failed: {e}")
-    return _mock_live_aqi()
+                for m in items:
+                    v = m.get("value")
+                    ts = ((m.get("period") or {}).get("datetimeFrom") or {}).get("utc")
+                    if v is None or v < 0 or not ts:
+                        continue
+                    out.append({"timestamp": ts, "value": v, "aqi": _pm25_to_aqi(v),
+                                "parameter": "pm25", "source": "openaq"})
+                if len(items) < 1000:
+                    break
+    except Exception as e:
+        logger.warning(f"OpenAQ history failed: {e}")
+    return sorted(out, key=lambda r: r["timestamp"])
 
 
-async def fetch_historical_aqi(station_id: str, days: int = 7) -> List[Dict]:
-    """Fetch historical PM2.5 for a station."""
-    date_from = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    async with httpx.AsyncClient(timeout=20) as client:
-        try:
-            resp = await client.get(
-                f"{OPENAQ_BASE}/measurements",
-                params={
-                    "location_id": station_id,
-                    "parameter": "pm25",
-                    "limit": 500,
-                    "sort": "desc",
-                    "date_from": date_from,
-                },
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code == 200:
-                items = resp.json().get("results", [])
-                if items:
-                    return [
-                        {
-                            "timestamp": m.get("date", {}).get("utc", ""),
-                            "value": m.get("value", 0),
-                            "aqi": _pm25_to_aqi(m.get("value", 0)),
-                            "parameter": "pm25",
-                        }
-                        for m in items
-                    ]
-        except Exception as e:
-            logger.warning(f"OpenAQ history fetch failed: {e}")
-    return _mock_historical_aqi()
+async def fetch_historical_aqi(station_id: str, days: int = 7, city: Optional[str] = None) -> List[Dict]:
+    """OpenAQ -> Supabase -> seeded mock. Always returned oldest-first."""
+    city = city or city_of_station(station_id)
+    if _has_key():
+        if station_id not in _SENSORS:
+            await fetch_stations(city)
+        data = await _openaq_history(station_id, days)
+        if len(data) >= 24:
+            return data
+    from db.supabase_client import load_history
+    stored = await load_history(station_id, days)
+    if stored and len(stored) >= 24:
+        return stored
+    return _mock_historical_aqi(station_id, city, days)
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 
-def _shape_measurement(m: Dict) -> Dict:
-    coords = m.get("coordinates") or {}
-    val = m.get("value", 0)
-    return {
-        "station_id": str(m.get("locationId", "")),
-        "station_name": m.get("location", ""),
-        "parameter": m.get("parameter", "pm25"),
-        "value": val,
-        "unit": m.get("unit", "µg/m³"),
-        "timestamp": (m.get("date") or {}).get("utc", ""),
-        "latitude": coords.get("latitude", 28.6139),
-        "longitude": coords.get("longitude", 77.2090),
-        "aqi": _pm25_to_aqi(val),
-    }
-
-
 def _pm25_to_aqi(pm25: float) -> float:
-    """US EPA linear interpolation formula for PM2.5 → AQI."""
+    """US EPA linear interpolation formula for PM2.5 -> AQI."""
+    pm25 = math.floor(pm25 * 10) / 10  # EPA truncates to 0.1
     breakpoints = [
         (0.0,   12.0,   0,   50),
         (12.1,  35.4,  51,  100),
@@ -142,38 +208,40 @@ def _pm25_to_aqi(pm25: float) -> float:
     return 500.0 if pm25 > 500 else 0.0
 
 
-def _mock_live_aqi() -> List[Dict]:
-    import random
-    rng = random.Random(42)
-    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+def _mock_pm25(rng: random.Random, base: float, ts: datetime, phase: float) -> float:
+    """Diurnal curve (morning/evening peaks) + multi-day drift + noise."""
+    h = ts.hour + ts.minute / 60
+    diurnal = 1 + 0.25 * math.cos(2 * math.pi * (h - 9) / 24) + 0.15 * math.cos(2 * math.pi * (h - 20) / 12)
+    drift = 1 + 0.2 * math.sin(2 * math.pi * (ts.timestamp() / 86400) / 4 + phase)
+    return max(5.0, base * diurnal * drift * rng.uniform(0.92, 1.08))
+
+
+def _mock_live_aqi(city: str) -> List[Dict]:
+    cfg = get_city(city)
+    now = datetime.now(timezone.utc)
     results = []
-    for s in _DELHI_STATIONS:
-        pm25 = rng.uniform(60, 280)
+    for i, s in enumerate(cfg["stations"]):
+        rng = random.Random(f"{s['id']}{now:%Y%m%d%H}")
+        pm25 = _mock_pm25(rng, cfg["mock_base_pm25"] * (0.85 + 0.06 * i), now, i)
         results.append({
-            "station_id": s["id"],
-            "station_name": s["name"],
-            "parameter": "pm25",
-            "value": round(pm25, 1),
-            "unit": "µg/m³",
-            "timestamp": now,
-            "latitude": s["latitude"],
-            "longitude": s["longitude"],
-            "aqi": _pm25_to_aqi(pm25),
+            "station_id": s["id"], "station_name": s["name"], "parameter": "pm25",
+            "value": round(pm25, 1), "unit": "µg/m³", "timestamp": _now_iso(),
+            "latitude": s["latitude"], "longitude": s["longitude"],
+            "aqi": _pm25_to_aqi(pm25), "source": "mock",
         })
     return results
 
 
-def _mock_historical_aqi() -> List[Dict]:
-    import random
-    rng = random.Random(7)
+def _mock_historical_aqi(station_id: str, city: str, days: int) -> List[Dict]:
+    cfg = get_city(city)
+    idx = next((i for i, s in enumerate(cfg["stations"]) if s["id"] == station_id), 0)
+    base = cfg["mock_base_pm25"] * (0.85 + 0.06 * idx)
+    rng = random.Random(station_id)
+    end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     readings = []
-    for i in range(168):
-        ts = datetime.utcnow() - timedelta(hours=i)
-        pm25 = rng.uniform(50, 300)
-        readings.append({
-            "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "value": round(pm25, 1),
-            "aqi": _pm25_to_aqi(pm25),
-            "parameter": "pm25",
-        })
+    for i in range(days * 24, -1, -1):
+        ts = end - timedelta(hours=i)
+        pm25 = _mock_pm25(rng, base, ts, idx)
+        readings.append({"timestamp": ts.strftime("%Y-%m-%dT%H:%M:%SZ"), "value": round(pm25, 1),
+                         "aqi": _pm25_to_aqi(pm25), "parameter": "pm25", "source": "mock"})
     return readings
