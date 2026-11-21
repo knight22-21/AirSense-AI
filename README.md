@@ -67,7 +67,7 @@ AQI = (I_hi - I_lo) / (C_hi - C_lo) × (C_pm25 - C_lo) + I_lo
 
 Where `[C_lo, C_hi]` are the PM2.5 concentration breakpoints and `[I_lo, I_hi]` are the corresponding AQI index breakpoints. This is applied in `services/openaq.py → _pm25_to_aqi()`.
 
-**Why this formula?** The EPA formula is internationally recognised and matches the scale used by India's CPCB, making our numbers directly comparable to official government portals.
+**Why this formula?** The EPA formula is internationally recognised and broadly comparable to CPCB's published AQI bands. CPCB uses its own sub-index breakpoints, so values are indicative rather than an official CPCB calculation.
 
 ---
 
@@ -129,7 +129,7 @@ All HTTP calls use `httpx.AsyncClient` (non-blocking) with a 15–20 second time
 
 ---
 
-### 5. LLM Integration — Groq + llama3-8b-8192
+### 5. LLM Integration — Groq + llama-3.1-8b-instant
 
 Two types of LLM-generated text via `services/llm.py`:
 
@@ -148,19 +148,19 @@ Respond ONLY with valid JSON: {advisory_en, advisory_hi, vulnerable_groups}"
 
 The model is constrained to `max_tokens=120–300` and `temperature=0.3` to keep outputs short and factual. Generated text is cached in-process by a fingerprint of the hotspot evidence (and AQI/risk for advisories), so repeated dashboard loads do not burn quota. All LLM calls have static fallback text so the app works without a Groq key.
 
-**Why llama3-8b-8192?** It's the fastest model on Groq's free tier (14,400 req/day) and handles structured JSON output reliably at this short context length.
+**Why llama-3.1-8b-instant?** It is fast on Groq's free tier and handles structured JSON output reliably at this short context length. The older `llama3-8b-8192` model is retired; `GROQ_MODEL` can override the default.
 
 ---
 
 ### 6. Geocoding & Maps — Leaflet + react-leaflet
 
-**Station markers:** `CircleMarker` components coloured by AQI severity using the US EPA colour scale. Radius increases to 22px when selected for clear visual focus.
+**Station markers:** `CircleMarker` components coloured by AQI severity using an accessible severity palette. Radius increases to 21px when selected for clear visual focus.
 
-**Enforcement hotspots:** Custom `L.divIcon` rendered as an orange teardrop pin (CSS `border-radius: 50% 50% 50% 0; transform: rotate(-45deg)`), matching Google Maps pin conventions.
+**Enforcement hotspots:** Custom `L.divIcon` rendered as an orange teardrop pin (CSS `border-radius: 50% 50% 50% 0; transform: rotate(-45deg)`), matching conventional map-pin semantics.
 
-**City navigation:** `FlyToCity` uses Leaflet's `map.flyTo()` with a 1.2-second animation when a new city is selected from the dropdown.
+**City navigation:** `FlyToCity` uses Leaflet's `map.flyTo()` with a 1.2-second animation when a new city is selected.
 
-**OSM tiles** are used as the base map (free, no API key) at 60% opacity so the dark UI background shows through.
+**OSM tiles** are used as the base map (free, no API key) at 82% opacity over a light government-style surface.
 
 ---
 
@@ -176,7 +176,33 @@ To extend to a new city: add its entry in `backend/config.py`, mirror it in `fro
 
 ---
 
-### 8. Weather Features — Open-Meteo Integration
+### 8. Frontend Experience
+
+The frontend is a **multi-page government-style portal** built with React Router, not a single scrolling dashboard. Shared masthead, utility strip, navigation, and footer keep the service consistent while each task has its own page:
+
+- `/` — public landing page with a city bulletin and service overview
+- `/dashboard` — live station map, ward overlay, threshold alerts, and station register
+- `/forecast` — station selector, 72-hour chart, 24/48/72-hour outlook, and model validation
+- `/enforcement` — evidence map and ranked source-candidate register
+- `/advisories` — multilingual citizen guidance, ward risk cards, and category meanings
+- `/about` — data sources, methodology, validation, limitations, and responsible-use notes
+- Unknown routes render a 404 page; city selection persists through the `?city=` query parameter
+
+Interface details:
+
+- Light navy/saffron government palette, serif headings, clear section hierarchy, and responsive tables
+- Persistent **prototype / not an official government portal** disclaimer in the header and footer
+- **Threshold alert banner** surfaces stations above AQI 200 and provides a **Focus worst** shortcut
+- **Data-age badge** warns when station observations are stale instead of pretending they are live
+- **Ward overlay toggle** colours ward polygons from backend IDW AQI, with a nearest-station fallback
+- **Forecast driver bars** show the top XGBoost feature importances behind the prediction
+- **Enforcement provenance** shows confidence, priority, receptor station, distance, and upwind status
+- **Multilingual advisory** supports English, Hindi, Tamil, and Kannada
+- **Layer controls** toggle the AQI heat layer, ward boundaries, and enforcement hotspots
+
+---
+
+### 9. Weather Features — Open-Meteo Integration
 
 `services/weather.py` fetches 72-hour hourly weather for the city centre from Open-Meteo (completely free, no key):
 
@@ -192,16 +218,20 @@ To extend to a new city: add its entry in `backend/config.py`, mirror it in `fro
 
 ```
 data/
-├── ward_boundaries/    ← GeoJSON ward polygons (not committed — download separately)
-│   ├── README.md       ← Instructions for obtaining Delhi ward boundaries
-│   └── delhi_wards.geojson  ← (you place this here manually)
+├── ward_boundaries/    ← Ward/district polygons, one file per city
+│   ├── README.md
+│   ├── delhi.geojson
+│   ├── mumbai.geojson
+│   ├── bengaluru.geojson
+│   ├── chennai.geojson
+│   └── kolkata.geojson
 │
 └── training_data/      ← Cached AQI + weather CSVs for offline model training
-    ├── README.md       ← Instructions for seeding data
-    └── *.csv           ← (generated by running the seed script — not committed)
+    ├── README.md
+    └── <city>_aqi.csv  ← generated by `python scheduler.py --seed`
 ```
 
-The `data/` folder is **intentionally empty** in the repository. Both subdirectories contain only README files explaining what to put there and how to get it. Large binary files (CSVs, GeoJSON) are git-ignored to keep the repo lightweight.
+The GeoJSON and CSV files are git-ignored to keep the repository lightweight. The backend loads `data/ward_boundaries/{city}.geojson` when present; otherwise it attempts an OSM Overpass fetch and caches the result. If neither works, the ward endpoint returns an empty FeatureCollection and the UI keeps station markers only.
 
 ---
 
@@ -216,17 +246,17 @@ cp .env.example .env    # OPENAQ_API_KEY (v3 needs a free key), GROQ_API_KEY, NA
 # Optional: run db/schema.sql in the Supabase SQL editor (PostGIS tables)
 python scheduler.py --seed --days 7        # backfill history -> Supabase + data/training_data/*.csv
 python models/forecaster.py --train --city delhi --days 90   # train + log RMSE vs persistence
-uvicorn main:app --reload
-# http://localhost:8000/docs  (Swagger UI)
+uvicorn main:app --reload --port 8001
+# http://localhost:8001/docs  (Swagger UI)
 pytest                                     # unit + API smoke tests
 ```
-Without keys everything still runs on clearly-flagged mock data (`data_source: "mock"`).
+Without keys everything still runs on clearly-flagged mock data (`data_source: "mock"`). Supabase is optional: when `SUPABASE_URL` / `SUPABASE_KEY` are absent, DB reads and writes become no-ops and the app falls back to OpenAQ or mock data. Existing `.pkl` models trained before the current metrics schema are ignored; the forecaster lazy-fits a 14-day in-memory model or uses the statistical fallback until you retrain.
 
 ### Frontend
 ```bash
 cd frontend
 npm install
-cp .env.example .env    # VITE_API_URL=http://localhost:8000
+cp .env.example .env    # VITE_API_URL=http://localhost:8001
 npm run dev
 # → http://localhost:5173
 ```
@@ -262,7 +292,7 @@ npm run dev
 | **Open-Meteo** | Completely free | 72-hour hourly weather forecast grid |
 | **NASA FIRMS** | Free with map key | VIIRS fire/thermal anomaly detections (375m) |
 | **OSM Overpass** | Free, rate-limited | Industrial land-use polygons around Delhi |
-| **Groq (llama3-8b)** | 14,400 req/day | Enforcement summaries + bilingual advisories |
+| **Groq (llama-3.1-8b-instant)** | Free tier, rate-limited | Enforcement summaries + multilingual advisories |
 | **Supabase** | 500 MB, 50k rows/month | PostgreSQL persistence |
 | **Vercel** | 100 GB bandwidth | React frontend hosting |
 | **Render.com** | 750 hrs/month | FastAPI backend hosting |
@@ -276,7 +306,7 @@ npm run dev
 | Backend | Python 3.11+, FastAPI 0.115, uvicorn, httpx (async HTTP) |
 | Scheduling | APScheduler 3.10 (AsyncIOScheduler, interval jobs) |
 | ML | XGBoost 2.1, scikit-learn 1.5, pandas 2.2, numpy 2.1 |
-| LLM | Groq SDK, model: llama3-8b-8192 |
+| LLM | Groq SDK, model: llama-3.1-8b-instant (override with `GROQ_MODEL`) |
 | Database | Supabase (supabase-py client), PostgreSQL |
 | Frontend | React 18, Vite 8, Tailwind CSS 3 |
 | Maps | Leaflet 1.9, react-leaflet 4 |
@@ -287,15 +317,21 @@ npm run dev
 
 ## Deployment
 
-**Backend:**
-1. Connect GitHub → select `backend/` as root
-2. Build command: `pip install -r requirements.txt`
-3. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Add env vars: `OPENAQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `GROQ_API_KEY`, `NASA_FIRMS_MAP_KEY`
+**Backend (Render):**
+1. Render Dashboard → **New +** → **Blueprint** → connect this repo; `render.yaml` defines the service
+2. Root directory: `backend`
+3. Build command: `pip install -r requirements.txt`
+4. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+5. Add env vars: `OPENAQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `GROQ_API_KEY`, `NASA_FIRMS_MAP_KEY`
+6. Set `ALLOWED_ORIGINS` to the deployed frontend URL (or `*` only for initial testing)
+7. Health check: `/health`
 
 **Frontend:**
-1. Connect GitHub → select `frontend/` as root
-2. Framework: Vite (auto-detected)
-3. Add env var: `VITE_API_URL=https://your-app.onrender.com`
+1. Vercel (recommended) or Render Static Site → root `frontend`
+2. Build: `npm install && npm run build`; publish directory: `dist`
+3. Add env var: `VITE_API_URL=https://your-backend.onrender.com`
+4. Redeploy the backend after setting `ALLOWED_ORIGINS` to the final frontend URL
+
+On Render's free tier the service sleeps after 15 minutes, so scheduler jobs only run while it is awake. Use an external uptime ping on `/health` if you need it warm during a demo.
 
 ---

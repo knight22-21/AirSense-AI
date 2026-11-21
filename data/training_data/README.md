@@ -38,9 +38,10 @@ asyncio.run(seed())
 ## Training the model
 
 ```bash
-# POST to the train endpoint once data is available:
-curl -X POST http://localhost:8000/forecast/train/anand-vihar
-# Returns: {"trained": true, "rmse": 18.4, "persistence_rmse": 22.1, "samples": 680}
+# Train one city model from up to 90 days of history:
+curl -X POST "http://localhost:8000/forecast/train/delhi?days=90"
+# Returns: {"trained": true, "rmse": ..., "persistence_rmse": ..., "samples": ...,
+#           "per_horizon": [...], "feature_importance": {...}}
 ```
 
 The RMSE vs persistence baseline shows how much better the XGBoost model is
