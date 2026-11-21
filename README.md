@@ -39,7 +39,7 @@ Most city air-quality portals show you a number and a colour. AirSense AI goes t
 ┌──────────────────── FASTAPI BACKEND ──────────────────────────────────────┐
 │                                                                            │
 │  /aqi/*          /forecast/*         /enforcement/*      /advisory/*      │
-│  Live + history  XGBoost forecast    Source-receptor     Groq LLaMA3      │
+│  Live + history  ML forecast         Source-receptor     Groq LLaMA3      │
 │  + ward IDW AQI  + backtest metrics  attribution         bilingual text    │
 │  /alerts/* — threshold breaches from the same live station network         │
 │                                                                            │
@@ -79,16 +79,20 @@ Where `[C_lo, C_hi]` are the PM2.5 concentration breakpoints and `[I_lo, I_hi]` 
 |---|---|---|
 | `_poll_aqi_data()` | every 30 min | OpenAQ v3 REST → PM2.5 → AQI → Supabase; also writes threshold alerts |
 | `_poll_weather_data()` | every 30 min | Open-Meteo 72-hour hourly weather grid → Supabase |
-| `_retrain_models()` | daily 03:00 | Retrains one XGBoost model per city from up to 90 days of history |
+| `_retrain_models()` | daily 03:00 | Retrains the selected forecast model per city from up to 90 days of history |
 | `_purge_old_data()` | every 6 h | Deletes readings >30 days, forecasts >7 days, alerts >30 days |
 
 All HTTP calls use `httpx.AsyncClient` (non-blocking) with a 15–20 second timeout. Every external call has a **static mock fallback** so the app works with zero internet connectivity — important for hackathon demos. `python scheduler.py --seed --days 7` backfills history into both Supabase and `data/training_data/*.csv`.
 
 ---
 
-### 3. AQI Forecasting — XGBoost + Feature Engineering
+### 3. AQI Forecasting — Multi-Model Comparison + Feature Engineering
 
-**Model:** `XGBRegressor` from XGBoost (gradient-boosted decision trees)
+**Models Evaluated:** We train and compare 4 machine learning models per city to select the best performer:
+- **XGBoost** — Gradient-boosted decision trees
+- **LightGBM** — Light gradient boosting with leaf-wise growth
+- **Random Forest** — Ensemble of decision trees
+- **Ridge Regression** — Regularized linear model with feature scaling
 
 **Features engineered per reading** (`models/forecaster.py`):
 
@@ -101,11 +105,26 @@ All HTTP calls use `httpx.AsyncClient` (non-blocking) with a 15–20 second time
 
 **Why lags + rolling stats?** Air quality has strong temporal autocorrelation — AQI at 3 AM tomorrow is heavily influenced by AQI at 3 AM today and the past 6-hour trend. Lags and rolling features capture this without needing an explicit time-series model.
 
+**Model Selection Strategy:** Each city uses the model that performs best on its specific data. We evaluate all 4 models on identical features, splits, and backtest origins, then select based on lowest pooled recursive RMSE over the full 72-hour hold-out (MAE breaks ties). This city-specific approach ensures optimal accuracy rather than forcing a one-size-fits-all model.
+
+**Per-City Selected Models:**
+| City | Selected Model | RMSE | vs Persistence | Top feature signal |
+|------|----------------|------|----------------|--------------------|
+| Delhi | Ridge Regression | 42.32 | 25.8% better | `lag_1` = 50% importance — strong autocorrelation |
+| Mumbai | Random Forest | 18.05 | 38.4% better | `lag_1` = 77% — near-persistence regime |
+| Bengaluru | Random Forest | 24.13 | 33.0% better | `lag_1` = 76%, `lag_2` = 13% |
+| Chennai | XGBoost | 32.98 | 25.3% better | Only city where `month` ranks top-3 (seasonal) |
+| Kolkata | LightGBM | 29.32 | 20.0% better | Importance spread across many lag/rolling features |
+
+**Why city-specific selection?** `lag_1` dominates everywhere but to different degrees (19–77%). Where one lag dominates (Mumbai, Bengaluru) tree ensembles win; where signals are diffuse or seasonal (Kolkata, Chennai, Delhi) boosted or regularized linear models win. Full verified numbers: `backend/models/MODEL_COMPARISON_REPORT.md`.
+
 **Training and validation:** an 80/20 chronological split, backtested over the full 72-hour product horizon when history allows (minimum 6 hours). We report **RMSE and MAE against a persistence baseline** and store the score **per horizon** so degradation with lead time is visible. Confidence intervals are empirical 10th/90th residual quantiles from the backtest; models trained before this change are treated as stale and rebuilt. The endpoint returns `model_metrics.feature_importance` so the UI can show forecast drivers.
 
 **Fallback:** When the model hasn't been trained or there is too little history, a **diurnal statistical forecaster** is used: a damped 24-hour rolling mean with rush-hour peaks (7–10 AM × 1.2, 5–9 PM × 1.15) and pre-dawn lows (2–5 AM × 0.80). No random noise is added — the fallback is deterministic and clearly labelled.
 
 **Honest limitation:** with only 7–14 days of history the backtest horizon is shorter than 72 hours and the persistence baseline is configured as same-hour-yesterday for the first 24 hours, then flat last-observation. The API reports the actual `horizon_hours`, `backtest_origins`, and sample count alongside every metric.
+
+**Detailed Model Comparison:** See `backend/models/MODEL_COMPARISON_REPORT.md` for full per-city model comparison, feature importance analysis, and training configuration details.
 
 ---
 
@@ -195,7 +214,7 @@ Interface details:
 - **Threshold alert banner** surfaces stations above AQI 200 and provides a **Focus worst** shortcut
 - **Data-age badge** warns when station observations are stale instead of pretending they are live
 - **Ward overlay toggle** colours ward polygons from backend IDW AQI, with a nearest-station fallback
-- **Forecast driver bars** show the top XGBoost feature importances behind the prediction
+- **Forecast driver bars** show the top feature importances from the selected model
 - **Enforcement provenance** shows confidence, priority, receptor station, distance, and upwind status
 - **Multilingual advisory** supports English, Hindi, Tamil, and Kannada
 - **Layer controls** toggle the AQI heat layer, ward boundaries, and enforcement hotspots
@@ -233,6 +252,22 @@ data/
 
 The GeoJSON and CSV files are git-ignored to keep the repository lightweight. The backend loads `data/ward_boundaries/{city}.geojson` when present; otherwise it attempts an OSM Overpass fetch and caches the result. If neither works, the ward endpoint returns an empty FeatureCollection and the UI keeps station markers only.
 
+## Model Training Results
+
+**Training artifacts and comparison report:**
+- `backend/models/training_metrics.json` — Full per-city metrics with per-horizon breakdown
+- `backend/models/aqi_{city}.pkl` — Serialized model artifacts for each city (local, git-ignored)
+- `backend/models/MODEL_COMPARISON_REPORT.md` — Detailed model comparison analysis
+
+The platform evaluates 4 models (XGBoost, LightGBM, Random Forest, Ridge) per city and selects the best performer based on lowest RMSE over a 72-hour backtest horizon (MAE breaks ties). Each city uses a different optimal model based on its feature-importance profile:
+- **Delhi:** Ridge Regression (`lag_1` ≈ 50% — strong autocorrelation)
+- **Mumbai:** Random Forest (`lag_1` ≈ 77% — dominant-lag regime)
+- **Bengaluru:** Random Forest (`lag_1` ≈ 76%, `lag_2` ≈ 13%)
+- **Chennai:** XGBoost (only city with `month` in top-3 features)
+- **Kolkata:** LightGBM (importance spread across many features)
+
+All selected models outperform the persistence baseline by 20–38% RMSE. This is a material improvement, not a formal significance test. See `backend/models/MODEL_COMPARISON_REPORT.md` for the full verified comparison.
+
 ---
 
 ## Quick Start
@@ -245,7 +280,8 @@ pip install -r requirements.txt
 cp .env.example .env    # OPENAQ_API_KEY (v3 needs a free key), GROQ_API_KEY, NASA_FIRMS_MAP_KEY, SUPABASE_*
 # Optional: run db/schema.sql in the Supabase SQL editor (PostGIS tables)
 python scheduler.py --seed --days 7        # backfill history -> Supabase + data/training_data/*.csv
-python models/forecaster.py --train --city delhi --days 90   # train + log RMSE vs persistence
+python models/forecaster.py --train --all --days 90   # train all cities + compare models
+# See backend/models/MODEL_COMPARISON_REPORT.md for detailed model comparison results
 uvicorn main:app --reload --port 8001
 # http://localhost:8001/docs  (Swagger UI)
 pytest                                     # unit + API smoke tests
@@ -272,7 +308,7 @@ npm run dev
 | GET | `/aqi/city/{city}` | City average + per-station breakdown + `data_age_minutes` |
 | GET | `/aqi/history/{station_id}?city=&days=7` | Hourly history (OpenAQ -> Supabase -> mock) |
 | GET | `/aqi/wards/{city}?with_aqi=true` | Ward boundary GeoJSON; optional IDW-interpolated AQI + `risk_level` per ward centroid |
-| GET | `/forecast/{station_id}?city=&hours=72` | Weather-aware recursive XGBoost forecast + `metrics` (RMSE/MAE vs persistence, per-horizon, feature importance) |
+| GET | `/forecast/{station_id}?city=&hours=72` | Weather-aware recursive ML forecast + `metrics` (RMSE/MAE vs persistence, per-horizon, feature importance) |
 | POST | `/forecast/train/{city}?days=90` | Train per-city model, 72-hour backtest, empirical quantile intervals |
 | GET | `/forecast/metrics/{city}` | Stored metrics incl. per-horizon accuracy and drivers |
 | GET | `/enforcement/{city}?limit=3&source_type=` | Ranked hotspots with source mix, `confidence`, `priority`, `receptor_station`, `distance_km`, `upwind` |
@@ -305,7 +341,7 @@ npm run dev
 |---|---|
 | Backend | Python 3.11+, FastAPI 0.115, uvicorn, httpx (async HTTP) |
 | Scheduling | APScheduler 3.10 (AsyncIOScheduler, interval jobs) |
-| ML | XGBoost 2.1, scikit-learn 1.5, pandas 2.2, numpy 2.1 |
+| ML | XGBoost 2.1, LightGBM 4.5, scikit-learn 1.5, pandas 2.2, numpy 2.1 |
 | LLM | Groq SDK, model: llama-3.1-8b-instant (override with `GROQ_MODEL`) |
 | Database | Supabase (supabase-py client), PostgreSQL |
 | Frontend | React 18, Vite 8, Tailwind CSS 3 |

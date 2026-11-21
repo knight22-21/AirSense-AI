@@ -138,7 +138,7 @@ function Footer({ city }) {
       <div className="border-t border-white/10">
         <div className="gov-container flex flex-col gap-2 py-4 text-[11px] text-slate-400 sm:flex-row sm:items-center sm:justify-between">
           <span>© {new Date().getFullYear()} AirSense AI · Minor project prototype</span>
-          <span>Built with FastAPI, React, XGBoost, Leaflet, and free-tier services</span>
+          <span>Built with FastAPI, React, multi-model ML, Leaflet, and free-tier services</span>
         </div>
       </div>
     </footer>

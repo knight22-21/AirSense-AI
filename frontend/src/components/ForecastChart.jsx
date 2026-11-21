@@ -10,6 +10,7 @@ import {
   ReferenceLine,
 } from 'recharts'
 import { useForecast } from '../hooks/useAQI'
+import { modelLabel } from '../config/models'
 
 const AQI_THRESHOLDS = [
   { value: 50, label: 'Good', color: '#15803d' },
@@ -127,11 +128,11 @@ export default function ForecastChart({
         </div>
         <div className="flex flex-wrap gap-1.5">
           <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
-            forecast.model === 'xgboost'
-              ? 'bg-blue-50 text-blue-800'
-              : 'bg-slate-100 text-slate-700'
+            forecast.model === 'statistical'
+              ? 'bg-slate-100 text-slate-700'
+              : 'bg-blue-50 text-blue-800'
           }`}>
-            {forecast.model === 'xgboost' ? 'XGBoost model' : 'Statistical fallback'}
+            {forecast.model === 'statistical' ? 'Statistical fallback' : `${modelLabel(forecast.model)} model`}
           </span>
           {forecast.metrics?.rmse != null && (
             <span className="rounded-full bg-green-50 px-2.5 py-1 text-[11px] font-semibold text-green-800">

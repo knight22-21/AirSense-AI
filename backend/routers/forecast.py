@@ -60,5 +60,5 @@ async def get_forecast(station_id: str, hours: int = 72, city: str = ""):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "horizon_hours": hours, "forecasts": forecasts, "model": model,
         "data_source": historical[0].get("source", "mock") if historical else "mock",
-        "metrics": model_metrics if model == "xgboost" else None,
+        "metrics": model_metrics,
     }

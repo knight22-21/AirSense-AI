@@ -49,7 +49,7 @@ const METHODOLOGY = [
   },
   {
     title: 'Forecasting',
-    text: 'Lag, rolling-window, calendar, and weather features feed an XGBoost model. A persistence baseline is reported alongside hold-out RMSE so the forecast can be judged fairly.',
+    text: 'Lag, rolling-window, calendar, and weather features feed a city-specific ML model. XGBoost, LightGBM, Random Forest, and Ridge are compared, and a persistence baseline is reported alongside hold-out RMSE.',
   },
   {
     title: 'Ward interpolation',
@@ -66,7 +66,7 @@ const METHODOLOGY = [
 ]
 
 const STACK = [
-  'Python 3.11', 'FastAPI', 'Uvicorn', 'XGBoost', 'pandas', 'NumPy',
+  'Python 3.11', 'FastAPI', 'Uvicorn', 'XGBoost', 'LightGBM', 'Random Forest', 'pandas', 'NumPy',
   'React 18', 'Vite', 'Tailwind CSS', 'Leaflet', 'Recharts', 'React Router',
   'OpenAQ', 'Open-Meteo', 'NASA FIRMS', 'OpenStreetMap', 'Supabase', 'Groq',
 ]
@@ -220,7 +220,7 @@ export default function About() {
               <h2 className="mt-1 font-serif text-xl font-bold text-red-950">Known gaps</h2>
               <ul className="mt-3 space-y-2 text-sm leading-relaxed text-red-900">
                 <li>Station coverage is sparse and uneven; interpolation is indicative.</li>
-                <li>Some bundled model artifacts are stale; the loader retrains lazily or uses statistical fallback.</li>
+                <li>Models trained before the current metrics schema are ignored; the loader retries or uses statistical fallback.</li>
                 <li>Attribution is evidence-weighted and cannot establish legal responsibility.</li>
                 <li>The free-tier deployment sleeps, so scheduled jobs do not run continuously.</li>
                 <li>Advisory translations can fall back to English if a model response is missing.</li>

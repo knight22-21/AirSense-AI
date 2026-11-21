@@ -8,6 +8,7 @@ import StatCard from '../components/StatCard'
 import { useAQIData, useForecast, useWards } from '../hooks/useAQI'
 import { useCityParam } from '../hooks/useCityParam'
 import { getCityById } from '../config/cities'
+import { modelLabel } from '../config/models'
 
 function valueTone(aqi) {
   if (aqi == null) return 'slate'
@@ -148,7 +149,7 @@ export default function Forecast() {
           <StatCard
             label="Peak in horizon"
             value={values.peak == null ? '—' : values.peak.toFixed(0)}
-            helper={values.avg == null ? 'No forecast data' : `Mean ${values.avg.toFixed(0)} · ${forecast?.model === 'xgboost' ? 'XGBoost' : 'fallback'}`}
+            helper={values.avg == null ? 'No forecast data' : `Mean ${values.avg.toFixed(0)} · ${modelLabel(forecast?.model)}`}
             tone={valueTone(values.peak)}
           />
         </div>
@@ -199,7 +200,7 @@ export default function Forecast() {
                 <dl className="mt-3 space-y-2 text-sm">
                   <div className="flex items-center justify-between gap-3 border-b border-gov-line pb-2">
                     <dt className="text-gov-muted">Model</dt>
-                    <dd className="font-semibold text-gov-ink">{forecast.model === 'xgboost' ? 'XGBoost' : 'Statistical fallback'}</dd>
+                    <dd className="font-semibold text-gov-ink">{modelLabel(forecast.model)}</dd>
                   </div>
                   <div className="flex items-center justify-between gap-3 border-b border-gov-line pb-2">
                     <dt className="text-gov-muted">Validation RMSE</dt>

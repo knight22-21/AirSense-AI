@@ -18,7 +18,7 @@ const SERVICES = [
   {
     no: '02',
     title: '72-hour station forecast',
-    text: 'XGBoost forecasts with per-horizon validation against a persistence baseline and empirical uncertainty bands.',
+    text: 'City-specific ML forecasts with per-horizon validation against a persistence baseline and empirical uncertainty bands.',
     to: '/forecast',
     action: 'View forecasts',
   },
