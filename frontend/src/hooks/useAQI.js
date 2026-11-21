@@ -52,31 +52,43 @@ export function useAQIData(city = 'delhi') {
   return { stations, liveReadings, dataSource, dataAgeMinutes, loading, error, lastUpdated, refresh: load }
 }
 
-export function useForecast(stationId, city = 'delhi') {
+export function useForecast(stationId, city = 'delhi', enabled = true) {
   const [forecast, setForecast] = useState(null)
   const [loading, setLoading]   = useState(false)
   const [error, setError]       = useState(null)
 
   useEffect(() => {
-    if (!stationId) return
+    if (!stationId || !enabled) {
+      setForecast(null)
+      setError(null)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     setError(null)
     fetchForecast(stationId, 72, city)
       .then(res => setForecast(res.data))
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
-  }, [stationId, city])
+  }, [stationId, city, enabled])
 
   return { forecast, loading, error }
 }
 
-export function useEnforcement(city = 'delhi') {
+export function useEnforcement(city = 'delhi', enabled = true) {
   const [hotspots, setHotspots]     = useState([])
   const [sourceMix, setSourceMix]   = useState(null)
   const [dataSource, setDataSource] = useState(null)
-  const [loading, setLoading]       = useState(true)
+  const [loading, setLoading]       = useState(enabled)
 
   useEffect(() => {
+    if (!enabled) {
+      setHotspots([])
+      setSourceMix(null)
+      setDataSource(null)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     setHotspots([])
     setSourceMix(null)
@@ -88,7 +100,7 @@ export function useEnforcement(city = 'delhi') {
       })
       .catch(() => setHotspots([]))
       .finally(() => setLoading(false))
-  }, [city])
+  }, [city, enabled])
 
   return { hotspots, sourceMix, dataSource, loading }
 }

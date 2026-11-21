@@ -6,35 +6,129 @@
   box-sizing: border-box;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 body {
   margin: 0;
-  background: #0f172a;
-  color: #e2e8f0;
+  background: #f3f6fa;
+  color: #1f2937;
   font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Leaflet map background */
+a {
+  color: inherit;
+}
+
+button,
+select,
+input {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid #e08a00;
+  outline-offset: 2px;
+}
+
 .leaflet-container {
-  background: #1a2744 !important;
+  background: #e5eaf0 !important;
+  font-family: 'Inter', system-ui, sans-serif !important;
 }
 
-/* Custom scrollbar */
+.leaflet-popup-content-wrapper {
+  border-radius: 6px;
+}
+
+.leaflet-control-attribution {
+  font-size: 10px !important;
+}
+
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #1e293b;
+  background: #eef2f7;
 }
 ::-webkit-scrollbar-thumb {
-  background: #475569;
-  border-radius: 3px;
+  background: #b8c4d2;
+  border-radius: 4px;
 }
 
-/* AQI badge animation */
-@keyframes pulse-badge {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0.6; }
+@layer components {
+  .gov-container {
+    @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8;
+  }
+
+  .gov-card {
+    @apply rounded-lg border border-gov-line bg-white shadow-sm;
+  }
+
+  .gov-card-flat {
+    @apply rounded-lg border border-gov-line bg-white;
+  }
+
+  .gov-kicker {
+    @apply text-[11px] font-bold uppercase tracking-[0.18em] text-gov-saffron;
+  }
+
+  .gov-heading {
+    @apply font-serif font-bold tracking-tight text-gov-navy;
+  }
+
+  .gov-btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md bg-gov-navy px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-gov-navyDeep focus:outline-none focus-visible:ring-2 focus-visible:ring-gov-saffron focus-visible:ring-offset-2;
+  }
+
+  .gov-btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-gov-navy bg-white px-4 py-2.5 text-sm font-semibold text-gov-navy transition-colors hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-gov-saffron focus-visible:ring-offset-2;
+  }
+
+  .gov-btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-semibold text-gov-navy transition-colors hover:bg-slate-100;
+  }
+
+  .gov-link {
+    @apply font-semibold text-gov-navy underline-offset-4 hover:underline;
+  }
+
+  .gov-label {
+    @apply text-[11px] font-bold uppercase tracking-[0.12em] text-gov-muted;
+  }
+
+  .gov-table {
+    @apply w-full border-collapse text-left text-sm;
+  }
+
+  .gov-table th {
+    @apply border-b border-gov-line bg-slate-50 px-3 py-2.5 text-[11px] font-bold uppercase tracking-[0.08em] text-gov-muted;
+  }
+
+  .gov-table td {
+    @apply border-b border-gov-line px-3 py-3 align-top text-gov-ink;
+  }
+
+  .gov-table tr:last-child td {
+    @apply border-b-0;
+  }
+
+  .gov-input {
+    @apply rounded-md border border-gov-line bg-white px-3 py-2 text-sm text-gov-ink shadow-sm focus:border-gov-navy focus:outline-none;
+  }
+
+  .gov-note {
+    @apply rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900;
+  }
 }
+
+@keyframes aqi-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.55; }
+}
+
 .aqi-pulse {
-  animation: pulse-badge 2s ease-in-out infinite;
+  animation: aqi-pulse 2s ease-in-out infinite;
 }
