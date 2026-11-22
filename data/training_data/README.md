@@ -39,7 +39,7 @@ asyncio.run(seed())
 
 ```bash
 # Train one city model from up to 90 days of history:
-curl -X POST "http://localhost:8000/forecast/train/delhi?days=90"
+curl -X POST "http://localhost:8001/forecast/train/delhi?days=90"
 # Returns: {"trained": true, "rmse": ..., "persistence_rmse": ..., "samples": ...,
 #           "per_horizon": [...], "feature_importance": {...}}
 ```
